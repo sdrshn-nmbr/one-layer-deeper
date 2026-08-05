@@ -1,0 +1,18 @@
+{
+  "artifacts": {
+    "candidate": ".artifacts/candidates/register_frontier_full_bptt/submission.py",
+    "geometry": ".artifacts/modal/analysis/e1_depth8_cycle.json",
+    "interventions": ".artifacts/modal/analysis/e1_test_interventions.json",
+    "jacobian": ".artifacts/modal/analysis/e1_depth8_jacobian.json",
+    "results": "autoresearch/orchestrator-260804-2322/results.tsv"
+  },
+  "findings": {
+    "errors": 0,
+    "mechanism_gate": "failed",
+    "official_submission_created": false,
+    "tests_passed": 160,
+    "untested_gaps": false
+  },
+  "status": "complete",
+  "verdict": "The 8.5 percent E1 model is a structured one-step classifier. Its feedback state is not causally required for E1 accuracy, and it does not transfer to variable-modulus E5."
+}

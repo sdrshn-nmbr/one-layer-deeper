@@ -20,7 +20,15 @@ class ReleaseSurfaceTests(unittest.TestCase):
                 self.assertTrue(any(item.startswith(prefix) for item in dependencies))
         self.assertEqual(
             project["tool"]["setuptools"]["packages"],
-            ["benchmark", "benchmark.manifests", "client", "data", "service", "service.static"],
+            [
+                "benchmark",
+                "benchmark.manifests",
+                "client",
+                "data",
+                "research",
+                "service",
+                "service.static",
+            ],
         )
         self.assertEqual(
             project["tool"]["setuptools"]["package-data"]["service"],

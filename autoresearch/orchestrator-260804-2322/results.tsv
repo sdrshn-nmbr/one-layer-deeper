@@ -1,0 +1,13 @@
+experiment	manifest	steps	test_accuracy	ood_accuracy	mean_accuracy	depth_certified	verdict	artifact
+frontier_anchor_original	e1	129	0.060000	0.100000	0.080000	0	anchor	.artifacts/modal/20260805T021644.315425Z-register_frontier_reproduction-8471f888
+frontier_anchor_repeat_1	e1	186	0.060000	0.100000	0.080000	0	reproduced	.artifacts/modal/20260805T060754.210103Z-register_frontier_reproduction-1936c7e7
+frontier_anchor_repeat_2	e1	231	0.060000	0.100000	0.080000	0	reproduced	.artifacts/modal/20260805T060749.799877Z-register_frontier_reproduction-f2c32329
+frontier_anchor	e2	610	0.020833	0.003333	0.012083	0	failed_transfer	.artifacts/modal/20260805T060751.162054Z-register_frontier_reproduction-8dd4e3eb
+frontier_anchor	e3	475	0.011250	0.006250	0.008750	0	failed_transfer	.artifacts/modal/20260805T060751.418904Z-register_frontier_reproduction-f0c7ceb8
+frontier_anchor	e5	1123	0.006667	0.000000	0.003333	0	failed_mechanism_gate	.artifacts/modal/20260805T060756.647557Z-register_frontier_reproduction-b1f5848c
+frontier_per_example	e1	86	0.046667	0.100000	0.073333	0	rejected	.artifacts/modal/20260805T060929.056658Z-register_frontier_per_example-5d0466de
+frontier_init_002	e1	198	0.060000	0.080000	0.070000	0	rejected	.artifacts/modal/20260805T060928.709048Z-register_frontier_init_002-6d54b625
+frontier_masked_entropy	e1	256	0.060000	0.100000	0.080000	0	neutral	.artifacts/modal/20260805T060928.454944Z-register_frontier_masked_entropy-551ccd74
+frontier_full_bptt	e1	194	0.060000	0.110000	0.085000	0	provisional_e1_incumbent	.artifacts/modal/20260805T060928.881963Z-register_frontier_full_bptt-af6a1897
+frontier_full_bptt_repeat	e1	253	0.060000	0.110000	0.085000	0	reproduced_e1	.artifacts/modal/20260805T061113.318601Z-register_frontier_full_bptt-2b273e5c
+frontier_full_bptt	e5	1111	0.007500	0.000000	0.003750	0	failed_mechanism_gate	.artifacts/modal/20260805T061113.699352Z-register_frontier_full_bptt-e5475e20

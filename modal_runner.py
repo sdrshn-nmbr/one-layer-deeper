@@ -24,6 +24,8 @@ from service.tiers import submission_manifest_timeouts
 
 APP_NAME = "one-layer-benchmark-runner"
 REMOTE_ROOT = "/workspace/one-layer-benchmark"
+ARTIFACT_ROOT = "/artifacts"
+ARTIFACT_VOLUME_NAME = "one-layer-deeper-artifacts"
 SUBMISSION_FUNCTION_NAME = "evaluate_submission"
 SUBMISSION_MANIFEST_TIMEOUTS = submission_manifest_timeouts()
 
@@ -43,6 +45,10 @@ GPU_FUNCTIONS = {gpu: function_name for gpu, (function_name, _) in GPU_CONFIGS.i
 
 
 app = modal.App(APP_NAME)
+artifact_volume = modal.Volume.from_name(
+    ARTIFACT_VOLUME_NAME,
+    create_if_missing=True,
+)
 
 image = (
     modal.Image.from_registry("nvidia/cuda:12.9.1-devel-ubuntu24.04", add_python="3.13")
@@ -84,6 +90,18 @@ image = (
     )
     .run_commands(
         f"cd {REMOTE_ROOT} && uv run --no-sync bash scripts/generate_datasets.sh",
+    )
+    .add_local_dir(
+        "research",
+        f"{REMOTE_ROOT}/research",
+        copy=True,
+        ignore=["__pycache__"],
+    )
+    .add_local_dir(
+        "submissions/recurrent",
+        f"{REMOTE_ROOT}/submissions/recurrent",
+        copy=True,
+        ignore=["__pycache__"],
     )
     .add_local_python_source("modal_runner")
 )
@@ -186,9 +204,18 @@ def _run_command(command: list[str], timeout_seconds: int = DEFAULT_TIMEOUT_SECO
 
 
 def _register_gpu_function(name: str, gpu: str) -> modal.Function:
-    @app.function(gpu=gpu, image=image, timeout=MAX_TIMEOUT_SECONDS, serialized=True, name=name)
+    @app.function(
+        gpu=gpu,
+        image=image,
+        timeout=MAX_TIMEOUT_SECONDS,
+        serialized=True,
+        name=name,
+        volumes={ARTIFACT_ROOT: artifact_volume},
+    )
     def run(command: list[str], timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS) -> dict[str, Any]:
-        return _run_command(command, timeout_seconds)
+        result = _run_command(command, timeout_seconds)
+        artifact_volume.commit()
+        return result
 
     return run
 

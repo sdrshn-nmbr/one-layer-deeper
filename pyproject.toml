@@ -25,7 +25,7 @@ requires = ["setuptools>=80"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["benchmark", "benchmark.manifests", "client", "data", "service", "service.static"]
+packages = ["benchmark", "benchmark.manifests", "client", "data", "research", "service", "service.static"]
 py-modules = ["submission_validation"]
 
 [tool.setuptools.package-data]

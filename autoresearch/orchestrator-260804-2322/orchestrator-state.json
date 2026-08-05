@@ -1,0 +1,10 @@
+{
+  "archetype": "optimize-metric",
+  "cycle_count": 4,
+  "goal": "Verify the 8 percent Easy reference, test transfer, isolate bundled choices, and use trained-state analyses to decide whether recurrence is the learned mechanism.",
+  "outcome": "CONVERGED",
+  "pending_verify": false,
+  "predicate": "Rule-faithful E1 repeats and E5 complete; checkpoints captured; isolated controls and trained-state causal analyses complete; no Medium run unless the Easy mechanism gate passes.",
+  "terminal_choice": "stop-at-verified",
+  "units_remaining": 0
+}

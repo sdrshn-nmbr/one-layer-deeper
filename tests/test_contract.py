@@ -26,6 +26,7 @@ from submission_validation import validate_submission_source
 ROOT = Path(__file__).resolve().parents[1]
 SAMPLES = {
     "baseline_adamw": 1,
+    "recurrent": 1,
 }
 
 
