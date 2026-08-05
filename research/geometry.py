@@ -125,6 +125,128 @@ def _transition_metrics(previous: Tensor, current: Tensor) -> dict[str, float | 
     }
 
 
+def _state_statistics(states: tuple[Tensor, ...]) -> list[dict[str, float | int]]:
+    statistics = []
+    for step, state in enumerate(states):
+        flattened = state.float().reshape(state.shape[0], -1)
+        mean = flattened.mean(dim=0, keepdim=True)
+        centered = flattened - mean
+        total_energy = flattened.square().mean()
+        shared_energy = mean.square().mean()
+        centered_energy = centered.square().mean()
+        singular_values = torch.linalg.svdvals(centered)
+        spectral_energy = singular_values.square()
+        if spectral_energy.sum().item() == 0:
+            effective_rank = 0.0
+        else:
+            probabilities = spectral_energy / spectral_energy.sum()
+            effective_rank = float(
+                torch.exp(
+                    -(probabilities * probabilities.clamp_min(1e-12).log()).sum()
+                ).item()
+            )
+        statistics.append(
+            {
+                "step": step,
+                "examples": flattened.shape[0],
+                "features_per_example": flattened.shape[1],
+                "total_rms": float(total_energy.sqrt().item()),
+                "shared_rms": float(shared_energy.sqrt().item()),
+                "centered_rms": float(centered_energy.sqrt().item()),
+                "centered_energy_fraction": float(
+                    (centered_energy / total_energy.clamp_min(1e-12)).item()
+                ),
+                "effective_rank": effective_rank,
+            }
+        )
+    return statistics
+
+
+def _gradient_sensitivity(model, batch, device: torch.device) -> dict[str, Any]:
+    input_ids, targets, attention_mask, target_positions = prepare_batch(batch, device)
+    if target_positions is None:
+        raise ValueError("gradient sensitivity requires separate output positions")
+    scratch_cell_outputs: list[Tensor] = []
+    scratch_cell = getattr(model.step, "scratch_cell", None)
+    handle = (
+        scratch_cell.register_forward_hook(
+            lambda _module, _inputs, output: scratch_cell_outputs.append(output)
+        )
+        if scratch_cell is not None
+        else None
+    )
+    with torch.enable_grad():
+        try:
+            trace = model.forward_with_trace(input_ids, attention_mask=attention_mask)
+        finally:
+            if handle is not None:
+                handle.remove()
+        batch_indices = torch.arange(trace.logits.shape[0], device=device)[:, None]
+        token_logits = trace.logits[
+            batch_indices,
+            target_positions.clamp_min(0),
+        ].float()
+        valid = targets != -100
+        loss = F.cross_entropy(token_logits[valid], targets[valid])
+        uses_scratch_state = bool(trace.scratch_states) and bool(
+            trace.scratch_states[0].numel()
+        )
+        if uses_scratch_state and scratch_cell is not None:
+            scratch_sources = (trace.scratch_states[0], *scratch_cell_outputs)
+        elif uses_scratch_state:
+            scratch_sources = trace.scratch_states
+        else:
+            scratch_sources = ()
+        states = (*trace.residue_states, *scratch_sources)
+        gradients = torch.autograd.grad(
+            loss,
+            states,
+            allow_unused=True,
+        )
+
+    def summarize(channel_states, channel_gradients):
+        rows = []
+        for step, (state, gradient) in enumerate(
+            zip(channel_states, channel_gradients, strict=True)
+        ):
+            if gradient is None:
+                rows.append(
+                    {
+                        "step": step,
+                        "activation_rms": float(state.float().square().mean().sqrt().item()),
+                        "gradient_rms": 0.0,
+                        "gradient_activation_rms": 0.0,
+                    }
+                )
+                continue
+            rows.append(
+                {
+                    "step": step,
+                    "activation_rms": float(state.float().square().mean().sqrt().item()),
+                    "gradient_rms": float(
+                        gradient.float().square().mean().sqrt().item()
+                    ),
+                    "gradient_activation_rms": float(
+                        (gradient.float() * state.float()).square().mean().sqrt().item()
+                    ),
+                }
+            )
+        return rows
+
+    residue_count = len(trace.residue_states)
+    return {
+        "loss": float(loss.item()),
+        "residue": summarize(
+            trace.residue_states,
+            gradients[:residue_count],
+        ),
+        "scratch": summarize(
+            scratch_sources,
+            gradients[residue_count:],
+        ),
+    }
+
+
 def _prompt_number(input_ids: Tensor, marker: int) -> Tensor:
     values = torch.zeros(
         input_ids.shape[0],
@@ -356,8 +478,11 @@ def analyze_checkpoint(
                 }
             )
 
+    uses_scratch_state = bool(trace.scratch_states) and bool(
+        trace.scratch_states[0].numel()
+    )
     scratch_transitions = []
-    if uses_residue_state and trace.scratch_states:
+    if uses_residue_state and uses_scratch_state:
         flattened_scratch = [
             state.reshape(-1, state.shape[-1]) for state in trace.scratch_states
         ]
@@ -398,6 +523,16 @@ def analyze_checkpoint(
         "register_transitions": register_transitions,
         "register_lag_two": register_lag_two,
         "scratch_transitions": scratch_transitions,
+        "scratch_statistics": (
+            _state_statistics(trace.scratch_states)
+            if uses_residue_state and uses_scratch_state
+            else []
+        ),
+        "gradient_sensitivity": (
+            _gradient_sensitivity(model, batch, device)
+            if uses_residue_state
+            else None
+        ),
     }
 
     if reference_run_dir is not None:
@@ -408,9 +543,22 @@ def analyze_checkpoint(
         if reference_manifest.name != manifest.name:
             raise ValueError("cross-model geometry requires matching manifests")
         reference_trace, _, _, _ = _trace_model(reference_model, batch, device)
+        reference_states = (
+            reference_trace.residue_states
+            if uses_residue_state
+            else reference_trace.prompt_states
+        )
+        reference_mask = (
+            torch.ones(
+                reference_states[0].shape[:2],
+                dtype=torch.bool,
+                device=reference_states[0].device,
+            )
+            if uses_residue_state
+            else attention_mask
+        )
         reference_flattened = [
-            _flatten_valid(state, attention_mask)
-            for state in reference_trace.prompt_states
+            _flatten_valid(state, reference_mask) for state in reference_states
         ]
         if len(reference_flattened) != len(flattened):
             raise ValueError("cross-model geometry requires matching recurrent steps")

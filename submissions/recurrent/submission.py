@@ -34,6 +34,7 @@ class ModelConfig:
     gated_update: bool = False
     state_tokens: int = 0
     scratch_tokens: int = 0
+    work_width: int = 0
     digit_slots: int = 16
     entropy_weight: float = 0.0
     entropy_active_only: bool = True
@@ -43,9 +44,16 @@ class ModelConfig:
     linear_initialization_scale: float | None = None
 
     def __post_init__(self) -> None:
-        if self.architecture not in {"transformer", "register", "causal_state"}:
+        if self.architecture not in {
+            "transformer",
+            "register",
+            "causal_state",
+            "causal_grid",
+            "causal_dcgru",
+        }:
             raise ValueError(
-                "architecture must be transformer, register, or causal_state"
+                "architecture must be transformer, register, causal_state, "
+                "causal_grid, or causal_dcgru"
             )
         if self.d_model < 1 or self.d_model % self.num_heads != 0:
             raise ValueError("d_model must be positive and divisible by num_heads")
@@ -55,11 +63,12 @@ class ModelConfig:
             or self.step_layers < 1
             or self.state_tokens < 0
             or self.scratch_tokens < 0
+            or self.work_width < 0
             or self.digit_slots < 1
         ):
             raise ValueError(
                 "mlp_ratio, num_loops, and step_layers must be positive; "
-                "state_tokens and scratch_tokens cannot be negative; "
+                "state_tokens, scratch_tokens, and work_width cannot be negative; "
                 "digit_slots must be positive"
             )
         if self.training_loop_cap is not None and self.training_loop_cap < 1:
@@ -79,15 +88,21 @@ class ModelConfig:
             raise ValueError("register architecture requires state feedback")
         if self.architecture == "transformer" and self.state_feedback != "none":
             raise ValueError("transformer architecture cannot use state feedback")
-        if self.architecture == "causal_state":
+        if self.architecture in {"causal_state", "causal_grid", "causal_dcgru"}:
             if self.state_feedback != "none":
-                raise ValueError("causal_state uses continuous hidden state directly")
+                raise ValueError("causal architectures use continuous hidden state directly")
             if self.final_hidden_mode != "per_example":
-                raise ValueError("causal_state requires per_example final state")
+                raise ValueError("causal architectures require per_example final state")
             if self.state_tokens:
-                raise ValueError("causal_state uses scratch_tokens, not state_tokens")
+                raise ValueError("causal architectures do not use state_tokens")
             if not self.structured_features:
-                raise ValueError("causal_state requires structured_features")
+                raise ValueError("causal architectures require structured_features")
+        if self.architecture in {"causal_grid", "causal_dcgru"} and self.scratch_tokens:
+            raise ValueError(f"{self.architecture} does not use recurrent scratch tokens")
+        if self.architecture == "causal_dcgru" and not self.work_width:
+            raise ValueError("causal_dcgru requires per-digit work channels")
+        if self.architecture != "causal_dcgru" and self.work_width:
+            raise ValueError("work_width is reserved for causal_dcgru")
         if self.entropy_weight < 0:
             raise ValueError("entropy_weight cannot be negative")
         if self.initialization_std is not None and self.initialization_std <= 0:
@@ -239,6 +254,57 @@ EXPERIMENTS = {
             num_loops=4,
             training_loop_cap=4,
             scratch_tokens=2,
+            digit_slots=16,
+            structured_features=True,
+            initialization_std=0.02,
+        ),
+        optimizer=OptimizerConfig(
+            learning_rate=3e-3,
+            wall_clock_schedule=True,
+        ),
+    ),
+    "causal_state_no_scratch_profile": ExperimentConfig(
+        model=ModelConfig(
+            architecture="causal_state",
+            d_model=64,
+            num_loops=4,
+            training_loop_cap=4,
+            scratch_tokens=0,
+            digit_slots=16,
+            structured_features=True,
+            initialization_std=0.02,
+        ),
+        optimizer=OptimizerConfig(
+            learning_rate=3e-3,
+            wall_clock_schedule=True,
+        ),
+    ),
+    "causal_grid_contract": ExperimentConfig(
+        model=ModelConfig(
+            architecture="causal_grid",
+            d_model=48,
+            num_loops=4,
+            training_loop_cap=4,
+            step_layers=2,
+            scratch_tokens=0,
+            digit_slots=16,
+            structured_features=True,
+            initialization_std=0.02,
+        ),
+        optimizer=OptimizerConfig(
+            learning_rate=3e-3,
+            wall_clock_schedule=True,
+        ),
+    ),
+    "causal_dcgru_contract": ExperimentConfig(
+        model=ModelConfig(
+            architecture="causal_dcgru",
+            d_model=48,
+            num_loops=4,
+            training_loop_cap=3,
+            step_layers=4,
+            scratch_tokens=0,
+            work_width=16,
             digit_slots=16,
             structured_features=True,
             initialization_std=0.02,
@@ -627,6 +693,147 @@ class CausalStateStep(nn.Module):
         return next_residue, next_scratch
 
 
+class GridTransitionLayer(nn.Module):
+    def __init__(self, width: int) -> None:
+        super().__init__()
+        self.state_norm = RMSNorm(width)
+        self.modulus_norm = RMSNorm(width)
+        self.state_local = nn.Conv1d(
+            width,
+            width,
+            kernel_size=3,
+            padding=1,
+            groups=width,
+            bias=False,
+        )
+        self.modulus_local = nn.Conv1d(
+            width,
+            width,
+            kernel_size=3,
+            padding=1,
+            groups=width,
+            bias=False,
+        )
+        self.mix = nn.Linear(6 * width, 2 * width)
+
+    def forward(self, residue: Tensor, modulus: Tensor) -> Tensor:
+        state = self.state_norm(residue)
+        static = self.modulus_norm(modulus)
+        local_state = self.state_local(state.transpose(1, 2)).transpose(1, 2)
+        local_static = self.modulus_local(static.transpose(1, 2)).transpose(1, 2)
+        features = torch.cat(
+            (
+                state,
+                local_state,
+                state * local_state,
+                static,
+                local_static,
+                static * local_state,
+            ),
+            dim=-1,
+        )
+        update_logits, candidate = self.mix(features).chunk(2, dim=-1)
+        update = update_logits.sigmoid()
+        return update * residue + (1 - update) * candidate.tanh()
+
+
+class CausalGridStep(nn.Module):
+    def __init__(self, config: ModelConfig) -> None:
+        super().__init__()
+        self.layers = nn.ModuleList(
+            GridTransitionLayer(config.d_model)
+            for _ in range(config.step_layers)
+        )
+
+    def forward(
+        self,
+        residue: Tensor,
+        modulus: Tensor,
+        scratch: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        if scratch.shape[1]:
+            raise ValueError("causal_grid received unexpected scratch state")
+        for layer in self.layers:
+            residue = layer(residue, modulus)
+        return residue, scratch
+
+
+class DirectionalProjection(nn.Module):
+    def __init__(self, width: int) -> None:
+        super().__init__()
+        self.projection = nn.Linear(width, 3 * width)
+
+    def forward(self, state: Tensor) -> Tensor:
+        left, stay, right = self.projection(state).chunk(3, dim=-1)
+        shifted_left = F.pad(left[:, 1:], (0, 0, 0, 1))
+        shifted_right = F.pad(right[:, :-1], (0, 0, 1, 0))
+        return (shifted_left + stay + shifted_right) * (3 ** -0.5)
+
+
+class DirectionalDCGRUCell(nn.Module):
+    def __init__(self, width: int) -> None:
+        super().__init__()
+        self.state_norm = RMSNorm(width)
+        self.modulus_norm = RMSNorm(width)
+        self.reset_projection = DirectionalProjection(width)
+        self.update_projection = DirectionalProjection(width)
+        self.candidate_projection = DirectionalProjection(width)
+        self.modulus_projection = nn.Linear(width, 3 * width)
+
+    def condition(self, modulus: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        normalized_modulus = self.modulus_norm(modulus)
+        return self.modulus_projection(normalized_modulus).chunk(3, dim=-1)
+
+    def forward(
+        self,
+        state: Tensor,
+        condition: tuple[Tensor, Tensor, Tensor],
+    ) -> Tensor:
+        normalized_state = self.state_norm(state)
+        modulus_reset, modulus_update, modulus_candidate = condition
+        reset = (
+            self.reset_projection(normalized_state) + modulus_reset
+        ).sigmoid()
+        update = (
+            self.update_projection(normalized_state) + modulus_update
+        ).sigmoid()
+        candidate = (
+            self.candidate_projection(reset * normalized_state)
+            + modulus_candidate
+        ).tanh()
+        return update * state + (1 - update) * candidate
+
+
+class CausalDCGRUStep(nn.Module):
+    def __init__(self, config: ModelConfig) -> None:
+        super().__init__()
+        self.residue_width = config.d_model
+        self.work_width = config.work_width
+        self.microsteps = config.step_layers
+        mutable_width = self.residue_width + self.work_width
+        self.modulus_projection = nn.Linear(config.d_model, mutable_width)
+        self.cell = DirectionalDCGRUCell(mutable_width)
+
+    def forward(
+        self,
+        residue: Tensor,
+        modulus: Tensor,
+        work: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        expected_work_shape = (*residue.shape[:2], self.work_width)
+        if work.shape != expected_work_shape:
+            raise ValueError(
+                f"causal_dcgru expected work shape {expected_work_shape}, "
+                f"received {tuple(work.shape)}"
+            )
+        state = torch.cat((residue, work), dim=-1)
+        static = self.modulus_projection(modulus)
+        condition = self.cell.condition(static)
+        for _ in range(self.microsteps):
+            state = self.cell(state, condition)
+        return state.split((self.residue_width, self.work_width), dim=-1)
+
+
 class CausalStateModel(nn.Module):
     def __init__(self, spec: ModelSpec, architecture: ModelConfig) -> None:
         super().__init__()
@@ -644,7 +851,12 @@ class CausalStateModel(nn.Module):
             if architecture.scratch_tokens
             else None
         )
-        self.step = CausalStateStep(architecture)
+        if architecture.architecture == "causal_grid":
+            self.step = CausalGridStep(architecture)
+        elif architecture.architecture == "causal_dcgru":
+            self.step = CausalDCGRUStep(architecture)
+        else:
+            self.step = CausalStateStep(architecture)
         self.final_norm = RMSNorm(architecture.d_model)
         self.head = nn.Linear(
             architecture.d_model,
@@ -661,7 +873,7 @@ class CausalStateModel(nn.Module):
 
     def _reset_parameters(self, standard_deviation: float) -> None:
         for module in self.modules():
-            if isinstance(module, (nn.Embedding, nn.Linear)):
+            if isinstance(module, (nn.Embedding, nn.Linear, nn.Conv1d)):
                 nn.init.normal_(
                     module.weight,
                     mean=0.0,
@@ -731,7 +943,9 @@ class CausalStateModel(nn.Module):
             2,
         )
         batch = input_ids.shape[0]
-        if self.scratch_embedding is None:
+        if self.architecture.architecture == "causal_dcgru":
+            scratch = residue[:, :, : self.architecture.work_width] * 0
+        elif self.scratch_embedding is None:
             scratch = residue.new_empty(batch, 0, residue.shape[-1])
         else:
             scratch = self.scratch_embedding[None, :, :].expand(batch, -1, -1)
@@ -1064,7 +1278,7 @@ class RegisterModel(nn.Module):
 
 
 def build_model_from_config(spec: ModelSpec, config: ModelConfig) -> nn.Module:
-    if config.architecture == "causal_state":
+    if config.architecture in {"causal_state", "causal_grid", "causal_dcgru"}:
         model = CausalStateModel(spec, config)
     elif config.architecture == "register":
         model = RegisterModel(spec, config)

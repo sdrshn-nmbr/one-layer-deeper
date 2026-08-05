@@ -98,6 +98,74 @@ class ResearchRunnerTests(unittest.TestCase):
         self.assertEqual(workload["flops"]["attention_forward"], 0)
         self.assertGreater(workload["flops"]["forward"], 0)
 
+    def test_causal_state_no_scratch_is_a_single_axis_profile_control(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            scratch_path = Path(directory) / "scratch.py"
+            no_scratch_path = Path(directory) / "no_scratch.py"
+            materialize_submission(
+                SUBMISSION,
+                "causal_state_contract",
+                scratch_path,
+            )
+            materialize_submission(
+                SUBMISSION,
+                "causal_state_no_scratch_profile",
+                no_scratch_path,
+            )
+            scratch = _calculated_workload(scratch_path, SMOKE_MANIFEST)
+            no_scratch = _calculated_workload(no_scratch_path, SMOKE_MANIFEST)
+        self.assertEqual(scratch["inputs"]["scratch_tokens"], 2)
+        self.assertEqual(no_scratch["inputs"]["scratch_tokens"], 0)
+        self.assertEqual(
+            scratch["inputs"] | {"scratch_tokens": 0},
+            no_scratch["inputs"],
+        )
+        self.assertGreater(
+            scratch["flops"]["forward"],
+            no_scratch["flops"]["forward"],
+        )
+
+    def test_causal_grid_materializes_and_records_cross_digit_work(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "submission.py"
+            materialize_submission(SUBMISSION, "causal_grid_contract", path)
+            workload = _calculated_workload(path, SMOKE_MANIFEST)
+            submission = _load_submission_file(path)
+            model = submission.build_model(
+                ModelSpec(
+                    vocab_size=17,
+                    max_seq_len=12,
+                    maximum_model_state_elements=500_000_000,
+                )
+            )
+        self.assertEqual(workload["inputs"]["architecture"], "causal_grid")
+        self.assertEqual(workload["inputs"]["scratch_tokens"], 0)
+        self.assertEqual(workload["inputs"]["layers_per_loop"], 2)
+        self.assertEqual(workload["flops"]["attention_forward"], 0)
+        self.assertEqual(len(model.step.layers), 2)
+        self.assertGreater(workload["flops"]["forward"], 0)
+
+    def test_causal_dcgru_materializes_with_directional_workload(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "submission.py"
+            materialize_submission(SUBMISSION, "causal_dcgru_contract", path)
+            workload = _calculated_workload(path, SMOKE_MANIFEST)
+            submission = _load_submission_file(path)
+            model = submission.build_model(
+                ModelSpec(
+                    vocab_size=17,
+                    max_seq_len=12,
+                    maximum_model_state_elements=500_000_000,
+                )
+            )
+        self.assertEqual(workload["inputs"]["architecture"], "causal_dcgru")
+        self.assertEqual(workload["inputs"]["work_width"], 16)
+        self.assertEqual(workload["inputs"]["training_recurrent_loops"], 3)
+        self.assertEqual(workload["inputs"]["layers_per_loop"], 4)
+        self.assertEqual(workload["flops"]["attention_forward"], 0)
+        self.assertEqual(model.step.microsteps, 4)
+        self.assertGreater(workload["flops"]["forward"], 0)
+
     def test_smoke_run_writes_immutable_receipt_and_exact_source(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             run_dir = run_experiment(

@@ -367,13 +367,261 @@ class RecurrentSubmissionTests(unittest.TestCase):
                 architecture="causal_state",
                 final_hidden_mode="batch_max",
             )
-        with self.assertRaisesRegex(ValueError, "scratch_tokens"):
+        with self.assertRaisesRegex(ValueError, "state_tokens"):
             self.module.ModelConfig(
                 architecture="causal_state",
                 state_tokens=1,
             )
         with self.assertRaisesRegex(ValueError, "structured_features"):
             self.module.ModelConfig(architecture="causal_state")
+        with self.assertRaisesRegex(ValueError, "does not use recurrent scratch"):
+            self.module.ModelConfig(
+                architecture="causal_grid",
+                structured_features=True,
+                scratch_tokens=1,
+            )
+        with self.assertRaisesRegex(ValueError, "requires per-digit work"):
+            self.module.ModelConfig(
+                architecture="causal_dcgru",
+                structured_features=True,
+            )
+        with self.assertRaisesRegex(ValueError, "reserved for causal_dcgru"):
+            self.module.ModelConfig(
+                architecture="causal_grid",
+                structured_features=True,
+                work_width=8,
+            )
+
+    def test_causal_grid_propagates_only_through_the_digit_grid(self) -> None:
+        torch.manual_seed(67)
+        model = self.build("causal_grid_contract").eval()
+        input_ids = torch.tensor(
+            [
+                [2, 10, 9, 10, 3, 11, 9, 4, 8],
+                [2, 10, 9, 10, 3, 12, 9, 4, 10],
+            ],
+            dtype=torch.long,
+        )
+        mask = torch.ones_like(input_ids, dtype=torch.bool)
+        with torch.no_grad():
+            trace = model.forward_with_trace(input_ids, attention_mask=mask)
+            logits, auxiliary = model(input_ids, attention_mask=mask)
+
+        self.assertIsNone(auxiliary)
+        torch.testing.assert_close(trace.logits, logits)
+        self.assertEqual(len(trace.residue_states), 5)
+        self.assertEqual(len(trace.scratch_states), 5)
+        self.assertEqual(tuple(trace.scratch_states[0].shape), (2, 0, 48))
+        self.assertEqual(tuple(trace.static_memory.shape), (2, 16, 48))
+        self.assertFalse(hasattr(model.step, "scratch_cell"))
+        self.assertTrue(
+            any(
+                not torch.equal(previous, current)
+                for previous, current in zip(
+                    trace.residue_states[:-1],
+                    trace.residue_states[1:],
+                    strict=True,
+                )
+            )
+        )
+        decoded = model.decode_residue(
+            trace.residue_states[-1],
+            mask,
+            input_ids.shape[1],
+        )
+        torch.testing.assert_close(decoded, logits)
+        prompt_bypass = logits + torch.nn.functional.linear(
+            model.token_embedding(input_ids),
+            model.head.weight,
+        )
+        with self.assertRaises(AssertionError):
+            torch.testing.assert_close(prompt_bypass, decoded)
+
+    def test_causal_grid_has_cross_slot_receptive_field(self) -> None:
+        torch.manual_seed(71)
+        model = self.build("causal_grid_contract").eval()
+        width = model.architecture.d_model
+        baseline = torch.zeros(1, model.architecture.digit_slots, width)
+        perturbed = baseline.clone()
+        perturbed[:, 0, :] = 1
+        modulus = torch.zeros_like(baseline)
+        scratch = baseline.new_empty(1, 0, width)
+        with torch.no_grad():
+            expected, _ = model.step(baseline, modulus, scratch)
+            actual, _ = model.step(perturbed, modulus, scratch)
+        self.assertGreater(
+            (actual[:, 1] - expected[:, 1]).abs().max().item(),
+            0,
+        )
+
+    def test_causal_grid_has_unbroken_grid_gradient_path(self) -> None:
+        torch.manual_seed(73)
+        model = self.build("causal_grid_contract").train()
+        input_ids = torch.tensor([[2, 10, 9, 10, 3, 11, 9, 4, 10]])
+        mask = torch.ones_like(input_ids, dtype=torch.bool)
+        trace = model.forward_with_trace(input_ids, attention_mask=mask)
+        trace.residue_states[0].retain_grad()
+        trace.logits.square().mean().backward()
+        self.assertIsNotNone(trace.residue_states[0].grad)
+        self.assertGreater(
+            torch.count_nonzero(trace.residue_states[0].grad).item(),
+            0,
+        )
+        first_layer = model.step.layers[0]
+        self.assertIsNotNone(first_layer.state_local.weight.grad)
+        self.assertGreater(
+            torch.count_nonzero(first_layer.state_local.weight.grad).item(),
+            0,
+        )
+
+    def test_causal_grid_interventions_target_the_tied_update(self) -> None:
+        torch.manual_seed(79)
+        model = self.build("causal_grid_contract").eval()
+        input_ids = torch.tensor(
+            [
+                [2, 10, 9, 10, 3, 11, 9, 4, 11],
+                [2, 10, 9, 10, 3, 12, 9, 4, 11],
+            ]
+        )
+        mask = torch.ones_like(input_ids, dtype=torch.bool)
+        interventions = _causal_state_interventions(model)
+
+        with torch.no_grad():
+            baseline = model.forward_with_trace(input_ids, attention_mask=mask)
+        with interventions["freeze_residue_all"]():
+            with torch.no_grad():
+                frozen = model.forward_with_trace(input_ids, attention_mask=mask)
+        with interventions["freeze_residue_after_step_1"]():
+            with torch.no_grad():
+                one_step = model.forward_with_trace(input_ids, attention_mask=mask)
+
+        self.assertNotIn("zero_scratch_transition", interventions)
+        for state in frozen.residue_states[1:]:
+            torch.testing.assert_close(state, frozen.residue_states[0])
+        torch.testing.assert_close(
+            one_step.residue_states[1],
+            baseline.residue_states[1],
+        )
+        for state in one_step.residue_states[2:]:
+            torch.testing.assert_close(state, one_step.residue_states[1])
+
+    def test_causal_dcgru_uses_directional_per_digit_work_state(self) -> None:
+        torch.manual_seed(83)
+        model = self.build("causal_dcgru_contract").eval()
+        input_ids = torch.tensor(
+            [
+                [2, 10, 9, 10, 3, 11, 9, 4, 8],
+                [2, 10, 9, 10, 3, 12, 9, 4, 10],
+            ],
+            dtype=torch.long,
+        )
+        mask = torch.ones_like(input_ids, dtype=torch.bool)
+        with torch.no_grad():
+            trace = model.forward_with_trace(input_ids, attention_mask=mask)
+            logits, auxiliary = model(input_ids, attention_mask=mask)
+
+        self.assertIsNone(auxiliary)
+        torch.testing.assert_close(trace.logits, logits)
+        self.assertEqual(tuple(trace.residue_states[0].shape), (2, 16, 48))
+        self.assertEqual(tuple(trace.scratch_states[0].shape), (2, 16, 16))
+        self.assertEqual(tuple(trace.static_memory.shape), (2, 16, 48))
+        torch.testing.assert_close(
+            trace.scratch_states[0],
+            torch.zeros_like(trace.scratch_states[0]),
+        )
+        self.assertGreater(
+            torch.count_nonzero(trace.scratch_states[1]).item(),
+            0,
+        )
+        decoded = model.decode_residue(
+            trace.residue_states[-1],
+            mask,
+            input_ids.shape[1],
+        )
+        torch.testing.assert_close(decoded, logits)
+
+    def test_directional_projection_moves_without_wrapping_boundaries(self) -> None:
+        torch.manual_seed(89)
+        cell = self.module.DirectionalDCGRUCell(8).eval()
+        baseline = torch.zeros(1, 16, 8)
+        perturbed = baseline.clone()
+        perturbed[:, 0] = 1
+        condition = tuple(torch.zeros_like(baseline) for _ in range(3))
+        with torch.no_grad():
+            expected = cell(baseline, condition)
+            actual = cell(perturbed, condition)
+        difference = actual - expected
+        self.assertGreater(difference[:, 1].abs().max().item(), 0)
+        torch.testing.assert_close(
+            difference[:, -1],
+            torch.zeros_like(difference[:, -1]),
+        )
+
+    def test_causal_dcgru_reuses_one_cell_for_all_microsteps(self) -> None:
+        torch.manual_seed(97)
+        model = self.build("causal_dcgru_contract").eval()
+        residue = torch.randn(2, 16, 48)
+        modulus = torch.randn_like(residue)
+        work = torch.zeros(2, 16, 16)
+        calls = 0
+
+        def count_calls(_module, _inputs, _output) -> None:
+            nonlocal calls
+            calls += 1
+
+        handle = model.step.cell.register_forward_hook(count_calls)
+        try:
+            with torch.no_grad():
+                model.step(residue, modulus, work)
+        finally:
+            handle.remove()
+        self.assertEqual(calls, 4)
+        self.assertEqual(model.step.microsteps, 4)
+
+    def test_causal_dcgru_has_unbroken_residue_and_work_gradients(self) -> None:
+        torch.manual_seed(101)
+        model = self.build("causal_dcgru_contract").train()
+        input_ids = torch.tensor([[2, 10, 9, 10, 3, 11, 9, 4, 10]])
+        mask = torch.ones_like(input_ids, dtype=torch.bool)
+        trace = model.forward_with_trace(input_ids, attention_mask=mask)
+        trace.residue_states[0].retain_grad()
+        trace.scratch_states[0].retain_grad()
+        trace.logits.square().mean().backward()
+        self.assertGreater(
+            torch.count_nonzero(trace.residue_states[0].grad).item(),
+            0,
+        )
+        self.assertGreater(
+            torch.count_nonzero(trace.scratch_states[0].grad).item(),
+            0,
+        )
+        weight = model.step.cell.reset_projection.projection.weight
+        self.assertIsNotNone(weight.grad)
+        self.assertGreater(torch.count_nonzero(weight.grad).item(), 0)
+
+    def test_causal_dcgru_work_interventions_target_work_only(self) -> None:
+        torch.manual_seed(103)
+        model = self.build("causal_dcgru_contract").eval()
+        input_ids = torch.tensor(
+            [
+                [2, 10, 9, 10, 3, 11, 9, 4, 10],
+                [2, 10, 9, 10, 3, 12, 9, 4, 10],
+            ]
+        )
+        mask = torch.ones_like(input_ids, dtype=torch.bool)
+        interventions = _causal_state_interventions(model)
+
+        with interventions["zero_work_transition"]():
+            with torch.no_grad():
+                zero_work = model.forward_with_trace(input_ids, attention_mask=mask)
+        with interventions["mean_work_transition"]():
+            with torch.no_grad():
+                mean_work = model.forward_with_trace(input_ids, attention_mask=mask)
+
+        for state in zero_work.scratch_states[1:]:
+            torch.testing.assert_close(state, torch.zeros_like(state))
+        for state in mean_work.scratch_states[1:]:
+            torch.testing.assert_close(state[0], state[1])
 
     def test_causal_state_masks_each_row_at_its_own_depth(self) -> None:
         torch.manual_seed(37)

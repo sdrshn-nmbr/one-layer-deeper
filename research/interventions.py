@@ -142,7 +142,7 @@ def _compare_measurement(
 @contextmanager
 def _output_hook(
     module: nn.Module,
-    transform: Callable[[nn.Module, tuple[Any, ...], Tensor], Tensor],
+    transform: Callable[[nn.Module, tuple[Any, ...], Any], Any],
 ) -> Iterator[None]:
     handle = module.register_forward_hook(transform)
     try:
@@ -182,11 +182,77 @@ def _freeze_after_step(model: nn.Module, completed_steps: int):
     return _output_hook(model.step.residue_cell, transform)
 
 
+def _grid_transition_output(
+    model: nn.Module,
+    residue_transform: Callable[[Tensor, Tensor], Tensor] | None = None,
+    work_transform: Callable[[Tensor, Tensor], Tensor] | None = None,
+):
+    def transform(_module, inputs, output):
+        residue = (
+            residue_transform(inputs[0], output[0])
+            if residue_transform is not None
+            else output[0]
+        )
+        work = (
+            work_transform(inputs[2], output[1])
+            if work_transform is not None
+            else output[1]
+        )
+        return residue, work
+
+    return _output_hook(
+        model.step,
+        transform,
+    )
+
+
+def _freeze_grid_after_step(model: nn.Module, completed_steps: int):
+    execution_loops = (
+        model.architecture.training_loop_cap
+        if model.architecture.training_loop_cap is not None
+        else model.architecture.num_loops
+    )
+    call_index = 0
+
+    def transform(previous: Tensor, candidate: Tensor) -> Tensor:
+        nonlocal call_index
+        step_index = call_index % execution_loops
+        call_index += 1
+        return candidate if step_index < completed_steps else previous
+
+    return _grid_transition_output(model, residue_transform=transform)
+
+
+def _batch_component_tensor(state: Tensor, component: str) -> Tensor:
+    if component not in {"mean", "centered"}:
+        raise ValueError("work component must be mean or centered")
+    mean = state.mean(dim=0, keepdim=True)
+    return mean.expand_as(state) if component == "mean" else state - mean
+
+
 def _swap_output(module: nn.Module, tokens_per_example: int):
     def transform(_module, _inputs, output):
         width = output.shape[-1]
         states = output.reshape(-1, tokens_per_example, width)
         return states.roll(shifts=1, dims=0).reshape_as(output)
+
+    return _output_hook(module, transform)
+
+
+def _batch_component_output(
+    module: nn.Module,
+    tokens_per_example: int,
+    component: str,
+):
+    if component not in {"mean", "centered"}:
+        raise ValueError("scratch component must be mean or centered")
+
+    def transform(_module, _inputs, output):
+        width = output.shape[-1]
+        states = output.reshape(-1, tokens_per_example, width)
+        mean = states.mean(dim=0, keepdim=True)
+        selected = mean.expand_as(states) if component == "mean" else states - mean
+        return selected.reshape_as(output)
 
     return _output_hook(module, transform)
 
@@ -212,11 +278,78 @@ def _replace_initial_state(
 
 
 def _causal_state_interventions(model: nn.Module):
+    digit_slots = int(model.architecture.digit_slots)
+    if not hasattr(model.step, "residue_cell"):
+        return {
+            "baseline": nullcontext,
+            "freeze_residue_all": lambda: _grid_transition_output(
+                model,
+                residue_transform=lambda previous, _candidate: previous,
+            ),
+            "freeze_residue_after_step_1": lambda: _freeze_grid_after_step(model, 1),
+            "freeze_residue_after_step_2": lambda: _freeze_grid_after_step(model, 2),
+            "zero_residue_transition": lambda: _grid_transition_output(
+                model,
+                residue_transform=lambda _previous, candidate: torch.zeros_like(
+                    candidate
+                ),
+            ),
+            "swap_residue_transition": lambda: _grid_transition_output(
+                model,
+                residue_transform=lambda _previous, candidate: candidate.roll(
+                    shifts=1,
+                    dims=0,
+                ),
+            ),
+            "zero_static_modulus": lambda: _replace_initial_state(
+                model,
+                0,
+                torch.zeros_like,
+            ),
+            "swap_static_modulus": lambda: _replace_initial_state(
+                model,
+                0,
+                lambda state: state.roll(shifts=1, dims=0),
+            ),
+        } | (
+            {
+                "zero_work_transition": lambda: _grid_transition_output(
+                    model,
+                    work_transform=lambda _previous, candidate: torch.zeros_like(
+                        candidate
+                    ),
+                ),
+                "freeze_work_transition": lambda: _grid_transition_output(
+                    model,
+                    work_transform=lambda previous, _candidate: previous,
+                ),
+                "mean_work_transition": lambda: _grid_transition_output(
+                    model,
+                    work_transform=lambda _previous, candidate: (
+                        _batch_component_tensor(candidate, "mean")
+                    ),
+                ),
+                "centered_work_transition": lambda: _grid_transition_output(
+                    model,
+                    work_transform=lambda _previous, candidate: (
+                        _batch_component_tensor(candidate, "centered")
+                    ),
+                ),
+                "swap_work_transition": lambda: _grid_transition_output(
+                    model,
+                    work_transform=lambda _previous, candidate: candidate.roll(
+                        shifts=1,
+                        dims=0,
+                    ),
+                ),
+            }
+            if model.architecture.work_width
+            else {}
+        )
     residue_cell = model.step.residue_cell
     scratch_cell = model.step.scratch_cell
     if scratch_cell is None:
         raise ValueError("causal-state intervention gate requires scratch state")
-    digit_slots = int(model.architecture.digit_slots)
     scratch_tokens = int(model.architecture.scratch_tokens)
     return {
         "baseline": nullcontext,
@@ -229,6 +362,17 @@ def _causal_state_interventions(model: nn.Module):
             digit_slots,
         ),
         "zero_scratch_transition": lambda: _zero_output(scratch_cell),
+        "freeze_scratch_transition": lambda: _freeze_output(scratch_cell),
+        "mean_scratch_transition": lambda: _batch_component_output(
+            scratch_cell,
+            scratch_tokens,
+            "mean",
+        ),
+        "centered_scratch_transition": lambda: _batch_component_output(
+            scratch_cell,
+            scratch_tokens,
+            "centered",
+        ),
         "swap_scratch_transition": lambda: _swap_output(
             scratch_cell,
             scratch_tokens,
@@ -297,7 +441,7 @@ def analyze_interventions(
 
     if hasattr(model, "decode_residue"):
         factories = _causal_state_interventions(model)
-        architecture = "causal_state"
+        architecture = model.architecture.architecture
     else:
         factories = _register_interventions(model)
         architecture = "register"

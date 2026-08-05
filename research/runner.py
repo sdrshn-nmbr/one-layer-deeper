@@ -274,6 +274,37 @@ def _calculated_workload(
         )
         attention = 0
         forward_flops = training_loops * recurrent_step + output_head
+    elif config.architecture == "causal_grid":
+        digit_slots = config.digit_slots
+        kernel_size = 3
+        depthwise_convolutions = (
+            4 * batch_size * digit_slots * d_model * kernel_size
+        )
+        feature_mixing = 24 * batch_size * digit_slots * d_model**2
+        recurrent_layer = depthwise_convolutions + feature_mixing
+        attention = 0
+        forward_flops = (
+            training_loops * layers_per_loop * recurrent_layer + output_head
+        )
+    elif config.architecture == "causal_dcgru":
+        digit_slots = config.digit_slots
+        mutable_width = d_model + config.work_width
+        modulus_input_projection = (
+            2 * batch_size * digit_slots * d_model * mutable_width
+        )
+        modulus_gate_projection = (
+            6 * batch_size * digit_slots * mutable_width**2
+        )
+        directional_gru_microstep = (
+            18 * batch_size * digit_slots * mutable_width**2
+        )
+        recurrent_step = (
+            modulus_input_projection
+            + modulus_gate_projection
+            + layers_per_loop * directional_gru_microstep
+        )
+        attention = 0
+        forward_flops = training_loops * recurrent_step + output_head
     else:
         projections_and_mlp = (
             (8 + 4 * ratio) * batch_size * total_tokens * d_model**2
@@ -299,6 +330,7 @@ def _calculated_workload(
             "prompt_tokens": prompt_tokens,
             "state_tokens": config.state_tokens,
             "scratch_tokens": config.scratch_tokens,
+            "work_width": config.work_width,
             "digit_slots": config.digit_slots,
             "total_tokens": total_tokens,
             "d_model": d_model,
@@ -331,6 +363,8 @@ def _calculated_workload(
             "embedding lookup, normalization, activation, and optimizer FLOPs are omitted",
             "the estimate uses the configured training loop cap; actual prompt T may be smaller",
             "the causal-state GRU estimate omits elementwise gates and reductions",
+            "the causal-grid estimate includes two depthwise convolutions and one six-to-two-width feature mix per layer",
+            "the causal-DCGRU estimate includes the modulus projection and three directional gate projections per microstep",
             "this file is calculated; measured device profiling is separate evidence",
         ],
     }
