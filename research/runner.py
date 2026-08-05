@@ -346,6 +346,7 @@ def _calculated_workload(
             "state_tokens": config.state_tokens,
             "scratch_tokens": config.scratch_tokens,
             "work_width": config.work_width,
+            "pair_routing": config.pair_routing,
             "digit_slots": config.digit_slots,
             "total_tokens": total_tokens,
             "d_model": d_model,
@@ -380,7 +381,7 @@ def _calculated_workload(
             "the causal-state GRU estimate omits elementwise gates and reductions",
             "the causal-grid estimate includes two depthwise convolutions and one six-to-two-width feature mix per layer",
             "the causal-DCGRU estimate includes the modulus projection and three directional gate projections per microstep",
-            "the pair-DCGRU estimate adds two residue projections, all ordered digit-pair products, learned dense routing, and output projection",
+            "the pair-DCGRU estimate adds two residue projections, all ordered digit-pair products, dense routing, and output projection",
             "this file is calculated; measured device profiling is separate evidence",
         ],
     }

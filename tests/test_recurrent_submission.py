@@ -90,8 +90,16 @@ class RecurrentSubmissionTests(unittest.TestCase):
         self.assertEqual(configs["scaled_init"]["initialization_std"], 0.02)
         self.assertEqual(
             configs["causal_dcgru_contract"]
-            | {"architecture": "causal_pair_dcgru"},
+            | {
+                "architecture": "causal_pair_dcgru",
+                "pair_routing": "learned",
+            },
             configs["causal_pair_dcgru_contract"],
+        )
+        self.assertEqual(
+            configs["causal_pair_dcgru_contract"]
+            | {"pair_routing": "uniform"},
+            configs["causal_uniform_pair_dcgru_contract"],
         )
         self.assertEqual(configs["scaled_init"]["d_model"], 128)
         self.assertEqual(configs["wide_scaled"]["d_model"], 512)
@@ -396,6 +404,19 @@ class RecurrentSubmissionTests(unittest.TestCase):
                 structured_features=True,
                 work_width=8,
             )
+        with self.assertRaisesRegex(ValueError, "requires pair routing"):
+            self.module.ModelConfig(
+                architecture="causal_pair_dcgru",
+                structured_features=True,
+                work_width=8,
+            )
+        with self.assertRaisesRegex(ValueError, "reserved for causal_pair_dcgru"):
+            self.module.ModelConfig(
+                architecture="causal_dcgru",
+                structured_features=True,
+                work_width=8,
+                pair_routing="uniform",
+            )
 
     def test_causal_grid_propagates_only_through_the_digit_grid(self) -> None:
         torch.manual_seed(67)
@@ -644,6 +665,21 @@ class RecurrentSubmissionTests(unittest.TestCase):
             torch.full_like(routes, 1 / 256),
         )
 
+    def test_uniform_pair_dcgru_has_no_trainable_route_table(self) -> None:
+        learned = self.build("causal_pair_dcgru_contract").eval()
+        uniform = self.build("causal_uniform_pair_dcgru_contract").eval()
+        interaction = uniform.step.pair_interaction
+
+        self.assertEqual(interaction.routing, "uniform")
+        self.assertIsNone(interaction.route_logits)
+        torch.testing.assert_close(
+            interaction.routing_weights(),
+            torch.full((16, 16, 16), 1 / 256),
+        )
+        learned_parameters = sum(parameter.numel() for parameter in learned.parameters())
+        uniform_parameters = sum(parameter.numel() for parameter in uniform.parameters())
+        self.assertEqual(learned_parameters - uniform_parameters, 16**3)
+
     def test_pair_dcgru_has_global_receptive_field_before_directional_sweep(
         self,
     ) -> None:
@@ -727,6 +763,16 @@ class RecurrentSubmissionTests(unittest.TestCase):
                 torch.full_like(interaction.route_logits, 1 / 256),
             )
         torch.testing.assert_close(interaction.route_logits, original_routes)
+
+    def test_uniform_pair_dcgru_keeps_content_interventions_without_route_mutation(
+        self,
+    ) -> None:
+        model = self.build("causal_uniform_pair_dcgru_contract").eval()
+        interventions = _causal_state_interventions(model)
+
+        self.assertIn("zero_pair_interaction", interventions)
+        self.assertIn("swap_pair_interaction", interventions)
+        self.assertNotIn("uniform_pair_routes", interventions)
 
     def test_causal_state_masks_each_row_at_its_own_depth(self) -> None:
         torch.manual_seed(37)

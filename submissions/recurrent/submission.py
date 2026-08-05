@@ -35,6 +35,7 @@ class ModelConfig:
     state_tokens: int = 0
     scratch_tokens: int = 0
     work_width: int = 0
+    pair_routing: str = "none"
     digit_slots: int = 16
     entropy_weight: float = 0.0
     entropy_active_only: bool = True
@@ -116,6 +117,13 @@ class ModelConfig:
                 )
         elif self.work_width:
             raise ValueError("work_width is reserved for causal DCGRU architectures")
+        if self.pair_routing not in {"none", "learned", "uniform"}:
+            raise ValueError("pair_routing must be none, learned, or uniform")
+        if self.architecture == "causal_pair_dcgru":
+            if self.pair_routing == "none":
+                raise ValueError("causal_pair_dcgru requires pair routing")
+        elif self.pair_routing != "none":
+            raise ValueError("pair_routing is reserved for causal_pair_dcgru")
         if self.entropy_weight < 0:
             raise ValueError("entropy_weight cannot be negative")
         if self.initialization_std is not None and self.initialization_std <= 0:
@@ -327,6 +335,25 @@ EXPERIMENTS = {
             wall_clock_schedule=True,
         ),
     ),
+    "causal_uniform_pair_dcgru_contract": ExperimentConfig(
+        model=ModelConfig(
+            architecture="causal_pair_dcgru",
+            d_model=48,
+            num_loops=4,
+            training_loop_cap=3,
+            step_layers=4,
+            scratch_tokens=0,
+            work_width=16,
+            pair_routing="uniform",
+            digit_slots=16,
+            structured_features=True,
+            initialization_std=0.02,
+        ),
+        optimizer=OptimizerConfig(
+            learning_rate=3e-3,
+            wall_clock_schedule=True,
+        ),
+    ),
     "causal_pair_dcgru_contract": ExperimentConfig(
         model=ModelConfig(
             architecture="causal_pair_dcgru",
@@ -336,6 +363,7 @@ EXPERIMENTS = {
             step_layers=4,
             scratch_tokens=0,
             work_width=16,
+            pair_routing="learned",
             digit_slots=16,
             structured_features=True,
             initialization_std=0.02,
@@ -877,22 +905,43 @@ class CausalDCGRUStep(nn.Module):
 
 
 class LearnedGlobalPairInteraction(nn.Module):
-    def __init__(self, digit_slots: int, residue_width: int, output_width: int) -> None:
+    def __init__(
+        self,
+        digit_slots: int,
+        residue_width: int,
+        output_width: int,
+        routing: str,
+    ) -> None:
         super().__init__()
+        if routing not in {"learned", "uniform"}:
+            raise ValueError("global pair routing must be learned or uniform")
         self.digit_slots = digit_slots
+        self.routing = routing
         self.residue_norm = RMSNorm(residue_width)
         self.aggregate_norm = RMSNorm(residue_width)
         self.left_projection = nn.Linear(residue_width, residue_width)
         self.right_projection = nn.Linear(residue_width, residue_width)
         self.output_projection = nn.Linear(residue_width, output_width)
-        self.route_logits = nn.Parameter(
-            torch.zeros(digit_slots, digit_slots, digit_slots)
-        )
+        if routing == "learned":
+            self.route_logits = nn.Parameter(
+                torch.zeros(digit_slots, digit_slots, digit_slots)
+            )
+            self.register_buffer("uniform_routes", None, persistent=False)
+        else:
+            self.register_parameter("route_logits", None)
+            self.register_buffer(
+                "uniform_routes",
+                torch.full(
+                    (digit_slots, digit_slots, digit_slots),
+                    1 / digit_slots**2,
+                ),
+                persistent=False,
+            )
 
     def routing_weights(self) -> Tensor:
-        return self.route_logits.flatten(1).softmax(dim=-1).view_as(
-            self.route_logits
-        )
+        if self.route_logits is None:
+            return self.uniform_routes
+        return self.route_logits.flatten(1).softmax(dim=-1).view_as(self.route_logits)
 
     def forward(self, residue: Tensor) -> Tensor:
         normalized = self.residue_norm(residue)
@@ -914,6 +963,7 @@ class CausalPairDCGRUStep(CausalDCGRUStep):
             config.digit_slots,
             config.d_model,
             config.d_model + config.work_width,
+            config.pair_routing,
         )
 
     def forward(

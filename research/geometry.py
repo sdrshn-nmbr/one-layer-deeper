@@ -194,7 +194,12 @@ def _pair_routing_statistics(model) -> dict[str, Any] | None:
             }
         )
     return {
-        "route_logit_std": float(interaction.route_logits.detach().float().std().item()),
+        "routing_mode": interaction.routing,
+        "route_logit_std": (
+            float(interaction.route_logits.detach().float().std().item())
+            if interaction.route_logits is not None
+            else None
+        ),
         "mean_symmetry_error": float(
             (weights - weights.transpose(1, 2)).abs().mean().item()
         ),
@@ -316,6 +321,7 @@ def _iteration_readouts(
     states: tuple[Tensor, ...],
     input_ids: Tensor,
     attention_mask: Tensor,
+    cohort_steps: int | None = None,
 ) -> list[dict[str, float | int]]:
     moduli = _prompt_number(input_ids, TOKEN_IDS["N"])
     expected_values = _prompt_number(input_ids, TOKEN_IDS["X"])
@@ -327,6 +333,8 @@ def _iteration_readouts(
         if step:
             expected_values = expected_values.square().remainder(moduli)
         eligible = requested_steps >= step
+        if cohort_steps is not None:
+            eligible = eligible & (requested_steps == cohort_steps)
         logits = model.decode_residue(
             state,
             attention_mask,
@@ -365,6 +373,11 @@ def _iteration_readouts(
         readouts.append(
             {
                 "step": step,
+                **(
+                    {"cohort_steps": cohort_steps}
+                    if cohort_steps is not None
+                    else {}
+                ),
                 "exact_accuracy": sum(exact) / len(exact),
                 "correct_examples": sum(exact),
                 "example_count": len(exact),
@@ -554,6 +567,22 @@ def analyze_checkpoint(
                 states,
                 batch["input_ids"].to(device),
                 batch.get("attention_mask", batch["input_ids"] != 0).to(device),
+            )
+            if uses_residue_state
+            else []
+        ),
+        "max_depth_iteration_readouts": (
+            _iteration_readouts(
+                model,
+                states,
+                batch["input_ids"].to(device),
+                batch.get("attention_mask", batch["input_ids"] != 0).to(device),
+                cohort_steps=int(
+                    _prompt_number(
+                        batch["input_ids"].to(device),
+                        TOKEN_IDS["T"],
+                    ).max().item()
+                ),
             )
             if uses_residue_state
             else []

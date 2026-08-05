@@ -369,11 +369,12 @@ def _causal_state_interventions(model: nn.Module):
                         pair_interaction,
                         digit_slots,
                     ),
-                    "uniform_pair_routes": lambda: _zero_parameter(
-                        pair_interaction.route_logits
-                    ),
                 }
             )
+            if pair_interaction.route_logits is not None:
+                interventions["uniform_pair_routes"] = lambda: _zero_parameter(
+                    pair_interaction.route_logits
+                )
         return interventions
     residue_cell = model.step.residue_cell
     scratch_cell = model.step.scratch_cell

@@ -193,7 +193,11 @@ class ResearchRunnerTests(unittest.TestCase):
 
         self.assertEqual(pair["inputs"]["architecture"], "causal_pair_dcgru")
         self.assertEqual(
-            dcgru["inputs"] | {"architecture": "causal_pair_dcgru"},
+            dcgru["inputs"]
+            | {
+                "architecture": "causal_pair_dcgru",
+                "pair_routing": "learned",
+            },
             pair["inputs"],
         )
         self.assertGreater(
@@ -201,6 +205,34 @@ class ResearchRunnerTests(unittest.TestCase):
             dcgru["flops"]["forward"],
         )
         self.assertEqual(tuple(model.step.pair_interaction.route_logits.shape), (16, 16, 16))
+
+    def test_uniform_pair_control_removes_only_route_parameters(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            learned_path = Path(directory) / "learned.py"
+            uniform_path = Path(directory) / "uniform.py"
+            materialize_submission(
+                SUBMISSION,
+                "causal_pair_dcgru_contract",
+                learned_path,
+            )
+            materialize_submission(
+                SUBMISSION,
+                "causal_uniform_pair_dcgru_contract",
+                uniform_path,
+            )
+            learned = _calculated_workload(learned_path, SMOKE_MANIFEST)
+            uniform = _calculated_workload(uniform_path, SMOKE_MANIFEST)
+
+        self.assertEqual(learned["flops"], uniform["flops"])
+        self.assertEqual(
+            learned["inputs"] | {"pair_routing": "uniform"},
+            uniform["inputs"],
+        )
+        self.assertEqual(
+            learned["state"]["model_elements"]
+            - uniform["state"]["model_elements"],
+            16**3,
+        )
 
     def test_smoke_run_writes_immutable_receipt_and_exact_source(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

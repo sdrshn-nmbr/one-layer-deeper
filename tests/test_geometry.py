@@ -46,6 +46,7 @@ class GeometryMetricTests(unittest.TestCase):
         class PairInteraction(nn.Module):
             def __init__(self) -> None:
                 super().__init__()
+                self.routing = "learned"
                 self.route_logits = nn.Parameter(torch.zeros(4, 4, 4))
 
             def routing_weights(self) -> torch.Tensor:
@@ -60,6 +61,7 @@ class GeometryMetricTests(unittest.TestCase):
         assert statistics is not None
 
         self.assertEqual(statistics["route_logit_std"], 0.0)
+        self.assertEqual(statistics["routing_mode"], "learned")
         self.assertEqual(statistics["mean_symmetry_error"], 0.0)
         self.assertAlmostEqual(
             statistics["outputs"][0]["normalized_entropy"],
