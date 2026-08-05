@@ -12,6 +12,227 @@ For competition updates, join [discord.gg/gpumode](https://discord.gg/gpumode) a
 We are grateful to [Modal](https://modal.com/) for supporting the GPU evaluation infrastructure and to [Northflank](https://northflank.com/) for supporting the competition service and leaderboard. Thank you both for helping make this research competition possible.
 
 
+## Fork research log
+
+This fork records our experiments. The upstream project still defines the competition.
+
+Our question is simple:
+
+> Can a small model learn `x <- x^2 mod N`, then apply that same step `T` times?
+
+The model receives `x`, `N`, and `T`. It learns only from final answers. We cannot put a modular-arithmetic solver in the model.
+
+We started with Easy because each model gets 60 H100 training seconds. This lets us reject weak ideas quickly. It also exposes an important trap: a model can get some answers right without learning a reusable step.
+
+### How we judge an experiment
+
+- Measure score, update count, time, and model size separately.
+- Change one important choice at a time.
+- Build experiments from typed configs so comparisons stay clean.
+- Save the exact source, settings, result, workload estimate, and checkpoint.
+- Test for prompt shortcuts, frozen state, wrong `T` handling, changed evaluation state, and broken gradients.
+- Use internal probes only when they can change the next experiment.
+- Treat score and learned behavior as separate evidence. A better score does not prove a better algorithm.
+
+An idea moves through these checks:
+
+1. Local behavior and gradient tests.
+2. Competition validation on the exact file we plan to run.
+3. Rough calculations for memory, work, and expected updates.
+4. One clean H100 run.
+5. State traces and controlled state changes on the saved model.
+6. Transfer from fixed-modulus E1 to variable-modulus E5.
+7. Medium only after the model passes the Easy behavior checks.
+
+### What the H100 profile told us
+
+Our first recurrent Transformer had about 202,000 model-state elements. At batch 512 and sequence length 12, one training update was roughly 7.36 GFLOP. Attention was only about 1.5% of that work.
+
+The matched public register model took 430.5 ms per H100 step:
+
+- Batch fetch: 280.8 ms.
+- Forward pass and loss: 85.9 ms.
+- Backward pass: 24.7 ms.
+
+The optimizer was only about 3.2% of an earlier measured step. Full attention was not the bottleneck. This ruled out custom attention kernels, KDA, sliding-window attention, and sparse attention as useful next steps.
+
+More updates also did not guarantee a better result. The 8.0% model scored exactly 8.0% after 129, 186, and 231 updates.
+
+Our later causal-state model had 68,736 model-state elements and completed 196 updates in 60.30 seconds. Its rough throughput was 23 GFLOP/s. This small model spends much of its time launching operations instead of using the H100's arithmetic units. That is an estimate, not a full roofline profile.
+
+### Experiment log
+
+#### 1. Recurrent register models
+
+We tested tied Transformer blocks, field and decimal-place features, continuous state, and hard token feedback.
+
+| Model | E1 test | E1 OOD | E1 mean | Decision |
+|---|---:|---:|---:|---|
+| Continuous recurrent register | 4.67% | 3.00% | 3.83% | Stop |
+| Discrete recurrent register | 2.00% | 1.00% | 1.50% | Stop |
+| Matched public register model | 6.00% | 10.00% | 8.00% | Keep as reference |
+
+The discrete model had lower validation loss but worse exact answers. Token loss and full-answer accuracy were telling us different things.
+
+A public Square-then-Reduce model had already scored 1.67%, or 2.00% with Muon. We did not repeat that weak branch.
+
+#### 2. Reproducing the 8.0% model
+
+Our copy matched the public model's parameter count, logits, and loss. The audit also found a batch-wide maximum in its final readout. We made that choice explicit in the experiment config.
+
+We then changed one choice at a time:
+
+| Change from the 8.0% reference | E1 mean | Result |
+|---|---:|---|
+| Per-example final readout | 7.33% | Worse |
+| Standard `0.02` initialization | 7.00% | Worse |
+| Entropy loss only on valid tokens | 8.00% | No change |
+| Train through every recurrent step | **8.50%** | Repeated twice |
+
+The 8.5% model is our best E1 reference. It did not transfer:
+
+| Dataset | Mean exact accuracy | Certified depth |
+|---|---:|---:|
+| E1 | 8.50% | None |
+| E2 | 1.21% | None |
+| E3 | 0.875% | None |
+| E5 | 0.375% | None |
+
+E1 has a fixed modulus, so shortcuts can work. E5 changes the modulus and is a better test of the learned operation.
+
+#### 3. Why 8.5% did not prove a learned loop
+
+On the fixed `T=8` check, the model reached 10.53% after one update and never improved. After step two, it entered an exact two-step cycle.
+
+CKA and Procrustes showed that later states were almost identical. A model-specific Jacobian lens showed that influence from early recurrent states shrank almost to zero. These measurements supported the diagnosis, but they did not prove it.
+
+The direct test was decisive: disabling feedback state changed E1 test accuracy, E1 OOD accuracy, and the `T=8` result by exactly zero. Removing field and decimal-place features caused a large drop.
+
+The 8.5% model is a good one-step classifier. It does not use feedback state to repeat the calculation.
+
+#### 4. Forcing the model to use state
+
+We then removed the direct path from the prompt to the answer:
+
+```text
+x -> encode once -> mutable residue state y0
+N --------------> fixed modulus memory m
+                  scratch state z0
+
+(y1, z1) = tied_cell(y0, z0, m)
+(y2, z2) = tied_cell(y1, z1, m)
+...
+answer = decode(yT)
+```
+
+The answer head reads only the final residue state. The model sees `x` once. It keeps `N` because every step needs the modulus.
+
+This design passed 167 local contract tests, standalone loading, competition validation, checksum checks, and a real CPU training step.
+
+One clean E1 H100 run produced:
+
+| Measurement | Result |
+|---|---:|
+| Updates | 196 |
+| Training time | 60.30 s |
+| Training loss | 2.860 -> 1.834 |
+| Test exact accuracy | 3.33% |
+| OOD exact accuracy | 0% |
+| E1 mean | 1.67% |
+| Certified depth | None |
+
+The loss fell normally. AdamW was not the main failure.
+
+#### 5. The state mattered, but the updates were wrong
+
+This model really used its state. At `T=4`, freezing state after step 1 or 2 changed every prediction. At `T=2`, freezing after step 1 changed 92.1% of predictions. But later updates made answers worse:
+
+| Evaluation | Full model | Freeze after step 1 | Freeze after step 2 |
+|---|---:|---:|---:|
+| E1 fixed `T=4` | 0% | 7.89% | 7.89% |
+| E1 held-out `T=6` | 0% | 6.00% | 9.00% |
+
+After training, we compared each state with the correct answer for that step. These answers were never used for training.
+
+| State at fixed `T=4` | Accuracy for the correct state at that step |
+|---|---:|
+| Encoded input `x` | 60.53% |
+| After update 1 | 5.26% |
+| After update 2 | 2.63% |
+| After update 3 | 2.63% |
+| After update 4 | 0% |
+
+The model uses its state, but the state does not hold the correct calculation. It stores changing guesses.
+
+Scratch state also looked like a shared clock or bias. Swapping it between examples changed only 2.63% of `T=4` predictions. Removing it changed every prediction and improved the loss.
+
+The local Jacobians showed stable or shrinking updates, not exploding values:
+
+| Transition | Spectral radius | Median singular value |
+|---|---:|---:|
+| 0 -> 1 | 0.731 | 0.501 |
+| 1 -> 2 | 0.718 | 0.482 |
+| 2 -> 3 | 0.831 | 0.537 |
+| 3 -> 4 | 0.937 | 0.651 |
+
+The update was stable enough. It had learned the wrong function. A different optimizer would only train that wrong function differently.
+
+### What we ruled out
+
+- A higher E1 score does not prove learned recurrence. The 8.5% model ignored feedback state.
+- Lower token loss does not guarantee more exact answers.
+- More updates do not guarantee a better score.
+- The attention type is not the main issue for these short inputs.
+- A Jacobian lens does not read the model's thoughts. It measures local sensitivity and needs direct state tests beside it.
+- This is not normal in-context learning. The prompt gives no examples from which to infer a new rule. The weights learn the rule; the state must apply it.
+- A more advanced optimizer is not useful until the model learns a useful update.
+- Medium stays blocked until a model works on E5 and passes the state tests.
+
+### Papers that changed the plan
+
+- [Improving the Neural GPU Architecture for Algorithm Learning](https://huggingface.co/papers/1702.08727): use a shared recurrent digit grid that can move information left and right.
+- [Looped Transformers for Length Generalization](https://huggingface.co/papers/2409.15647): train one shared update at different depths. We do not reuse its direct prompt injection.
+- [Less is More: Recursive Reasoning with Tiny Networks](https://huggingface.co/papers/2510.04871): keep the fixed problem, changing answer, and scratch memory separate.
+
+Tabular-model ideas helped us encode `N`, `x`, `T`, and decimal place. Those features improved E1, but they did not perform the calculation.
+
+### What we will try next
+
+We will stop tuning the current model. Each digit updates mostly on its own, and the digits share only a pooled summary. Squaring needs digits to exchange products and carries. Modular reduction also needs comparison and subtraction across digits.
+
+The next model will use a shared recurrent digit grid:
+
+- One lane for each decimal place.
+- Information moves left and right between nearby digits.
+- Modulus digits stay available at matching positions.
+- The answer comes only from the final grid.
+- A small global controller is added only if local updates work but modular reduction fails.
+- Start with AdamW and train through every step.
+
+We will continue only if:
+
+- Changing the state changes the answer.
+- Later states move toward the correct intermediate answers.
+- The state does not get stuck or enter a short cycle.
+- E5 reaches at least 0.75% and gets at least one OOD-modulus answer right.
+- The model passes these checks before we try Medium.
+
+### Code and evidence map
+
+- [`submissions/recurrent/submission.py`](submissions/recurrent/submission.py): experiment configs and models.
+- [`research/runner.py`](research/runner.py): checks, workload estimates, H100 runs, and receipts.
+- [`research/step_benchmark.py`](research/step_benchmark.py): step timing.
+- [`research/interventions.py`](research/interventions.py): state tests.
+- [`research/geometry.py`](research/geometry.py): per-step results, CKA, Procrustes, and cycle checks.
+- [`research/jacobian.py`](research/jacobian.py): Jacobian lens and local transition measurements.
+- [`autoresearch/orchestrator-260804-2322/results.tsv`](autoresearch/orchestrator-260804-2322/results.tsv): result ledger.
+- [`autoresearch/orchestrator-260804-2322/handoff.json`](autoresearch/orchestrator-260804-2322/handoff.json): final verdict for the 8.5% model.
+
+Large checkpoints, profiles, and detailed traces stay in the ignored `.artifacts/` directory. They are not part of this public fork. The source, tests, result ledger, and decisions are versioned here.
+
+No official competition submission was created by this research run.
+
+
 ## Install
 
 #### CLI only for remote GPU use
