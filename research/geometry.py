@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import replace
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -160,6 +161,45 @@ def _state_statistics(states: tuple[Tensor, ...]) -> list[dict[str, float | int]
             }
         )
     return statistics
+
+
+def _pair_routing_statistics(model) -> dict[str, Any] | None:
+    interaction = getattr(model.step, "pair_interaction", None)
+    if interaction is None:
+        return None
+    weights = interaction.routing_weights().detach().float().cpu()
+    slot_count = weights.shape[0]
+    flattened = weights.flatten(1)
+    entropy = -(flattened * flattened.clamp_min(1e-12).log()).sum(dim=-1)
+    rows = []
+    source_left = torch.arange(slot_count)[:, None]
+    source_right = torch.arange(slot_count)[None, :]
+    for output_slot in range(slot_count):
+        top_index = int(flattened[output_slot].argmax().item())
+        left_slot, right_slot = divmod(top_index, slot_count)
+        convolution_mask = source_left + source_right == output_slot
+        rows.append(
+            {
+                "output_slot": output_slot,
+                "normalized_entropy": float(
+                    (entropy[output_slot] / math.log(slot_count**2)).item()
+                ),
+                "effective_pair_count": float(entropy[output_slot].exp().item()),
+                "top_left_slot": left_slot,
+                "top_right_slot": right_slot,
+                "top_weight": float(flattened[output_slot, top_index].item()),
+                "sum_route_mass": float(
+                    weights[output_slot][convolution_mask].sum().item()
+                ),
+            }
+        )
+    return {
+        "route_logit_std": float(interaction.route_logits.detach().float().std().item()),
+        "mean_symmetry_error": float(
+            (weights - weights.transpose(1, 2)).abs().mean().item()
+        ),
+        "outputs": rows,
+    }
 
 
 def _gradient_sensitivity(model, batch, device: torch.device) -> dict[str, Any]:
@@ -533,6 +573,7 @@ def analyze_checkpoint(
             if uses_residue_state
             else None
         ),
+        "pair_routing": _pair_routing_statistics(model),
     }
 
     if reference_run_dir is not None:

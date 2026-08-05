@@ -277,10 +277,22 @@ def _replace_initial_state(
         model._initial_states = original
 
 
+@contextmanager
+def _zero_parameter(parameter: nn.Parameter) -> Iterator[None]:
+    original = parameter.detach().clone()
+    with torch.no_grad():
+        parameter.zero_()
+    try:
+        yield
+    finally:
+        with torch.no_grad():
+            parameter.copy_(original)
+
+
 def _causal_state_interventions(model: nn.Module):
     digit_slots = int(model.architecture.digit_slots)
     if not hasattr(model.step, "residue_cell"):
-        return {
+        interventions = {
             "baseline": nullcontext,
             "freeze_residue_all": lambda: _grid_transition_output(
                 model,
@@ -311,41 +323,58 @@ def _causal_state_interventions(model: nn.Module):
                 0,
                 lambda state: state.roll(shifts=1, dims=0),
             ),
-        } | (
-            {
-                "zero_work_transition": lambda: _grid_transition_output(
-                    model,
-                    work_transform=lambda _previous, candidate: torch.zeros_like(
-                        candidate
+        }
+        if model.architecture.work_width:
+            interventions.update(
+                {
+                    "zero_work_transition": lambda: _grid_transition_output(
+                        model,
+                        work_transform=lambda _previous, candidate: torch.zeros_like(
+                            candidate
+                        ),
                     ),
-                ),
-                "freeze_work_transition": lambda: _grid_transition_output(
-                    model,
-                    work_transform=lambda previous, _candidate: previous,
-                ),
-                "mean_work_transition": lambda: _grid_transition_output(
-                    model,
-                    work_transform=lambda _previous, candidate: (
-                        _batch_component_tensor(candidate, "mean")
+                    "freeze_work_transition": lambda: _grid_transition_output(
+                        model,
+                        work_transform=lambda previous, _candidate: previous,
                     ),
-                ),
-                "centered_work_transition": lambda: _grid_transition_output(
-                    model,
-                    work_transform=lambda _previous, candidate: (
-                        _batch_component_tensor(candidate, "centered")
+                    "mean_work_transition": lambda: _grid_transition_output(
+                        model,
+                        work_transform=lambda _previous, candidate: (
+                            _batch_component_tensor(candidate, "mean")
+                        ),
                     ),
-                ),
-                "swap_work_transition": lambda: _grid_transition_output(
-                    model,
-                    work_transform=lambda _previous, candidate: candidate.roll(
-                        shifts=1,
-                        dims=0,
+                    "centered_work_transition": lambda: _grid_transition_output(
+                        model,
+                        work_transform=lambda _previous, candidate: (
+                            _batch_component_tensor(candidate, "centered")
+                        ),
                     ),
-                ),
-            }
-            if model.architecture.work_width
-            else {}
-        )
+                    "swap_work_transition": lambda: _grid_transition_output(
+                        model,
+                        work_transform=lambda _previous, candidate: candidate.roll(
+                            shifts=1,
+                            dims=0,
+                        ),
+                    ),
+                }
+            )
+        pair_interaction = getattr(model.step, "pair_interaction", None)
+        if pair_interaction is not None:
+            interventions.update(
+                {
+                    "zero_pair_interaction": lambda: _zero_output(
+                        pair_interaction
+                    ),
+                    "swap_pair_interaction": lambda: _swap_output(
+                        pair_interaction,
+                        digit_slots,
+                    ),
+                    "uniform_pair_routes": lambda: _zero_parameter(
+                        pair_interaction.route_logits
+                    ),
+                }
+            )
+        return interventions
     residue_cell = model.step.residue_cell
     scratch_cell = model.step.scratch_cell
     if scratch_cell is None:

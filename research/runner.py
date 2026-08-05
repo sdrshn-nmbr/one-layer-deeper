@@ -286,7 +286,7 @@ def _calculated_workload(
         forward_flops = (
             training_loops * layers_per_loop * recurrent_layer + output_head
         )
-    elif config.architecture == "causal_dcgru":
+    elif config.architecture in {"causal_dcgru", "causal_pair_dcgru"}:
         digit_slots = config.digit_slots
         mutable_width = d_model + config.work_width
         modulus_input_projection = (
@@ -303,6 +303,21 @@ def _calculated_workload(
             + modulus_gate_projection
             + layers_per_loop * directional_gru_microstep
         )
+        if config.architecture == "causal_pair_dcgru":
+            pair_projections = 4 * batch_size * digit_slots * d_model**2
+            pair_products = batch_size * digit_slots**2 * d_model
+            pair_aggregation = (
+                2 * batch_size * digit_slots**3 * d_model
+            )
+            pair_output_projection = (
+                2 * batch_size * digit_slots * d_model * mutable_width
+            )
+            recurrent_step += (
+                pair_projections
+                + pair_products
+                + pair_aggregation
+                + pair_output_projection
+            )
         attention = 0
         forward_flops = training_loops * recurrent_step + output_head
     else:
@@ -365,6 +380,7 @@ def _calculated_workload(
             "the causal-state GRU estimate omits elementwise gates and reductions",
             "the causal-grid estimate includes two depthwise convolutions and one six-to-two-width feature mix per layer",
             "the causal-DCGRU estimate includes the modulus projection and three directional gate projections per microstep",
+            "the pair-DCGRU estimate adds two residue projections, all ordered digit-pair products, learned dense routing, and output projection",
             "this file is calculated; measured device profiling is separate evidence",
         ],
     }

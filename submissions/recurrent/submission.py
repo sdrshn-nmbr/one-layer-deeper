@@ -50,10 +50,11 @@ class ModelConfig:
             "causal_state",
             "causal_grid",
             "causal_dcgru",
+            "causal_pair_dcgru",
         }:
             raise ValueError(
                 "architecture must be transformer, register, causal_state, "
-                "causal_grid, or causal_dcgru"
+                "causal_grid, causal_dcgru, or causal_pair_dcgru"
             )
         if self.d_model < 1 or self.d_model % self.num_heads != 0:
             raise ValueError("d_model must be positive and divisible by num_heads")
@@ -88,7 +89,12 @@ class ModelConfig:
             raise ValueError("register architecture requires state feedback")
         if self.architecture == "transformer" and self.state_feedback != "none":
             raise ValueError("transformer architecture cannot use state feedback")
-        if self.architecture in {"causal_state", "causal_grid", "causal_dcgru"}:
+        if self.architecture in {
+            "causal_state",
+            "causal_grid",
+            "causal_dcgru",
+            "causal_pair_dcgru",
+        }:
             if self.state_feedback != "none":
                 raise ValueError("causal architectures use continuous hidden state directly")
             if self.final_hidden_mode != "per_example":
@@ -97,12 +103,19 @@ class ModelConfig:
                 raise ValueError("causal architectures do not use state_tokens")
             if not self.structured_features:
                 raise ValueError("causal architectures require structured_features")
-        if self.architecture in {"causal_grid", "causal_dcgru"} and self.scratch_tokens:
+        if self.architecture in {
+            "causal_grid",
+            "causal_dcgru",
+            "causal_pair_dcgru",
+        } and self.scratch_tokens:
             raise ValueError(f"{self.architecture} does not use recurrent scratch tokens")
-        if self.architecture == "causal_dcgru" and not self.work_width:
-            raise ValueError("causal_dcgru requires per-digit work channels")
-        if self.architecture != "causal_dcgru" and self.work_width:
-            raise ValueError("work_width is reserved for causal_dcgru")
+        if self.architecture in {"causal_dcgru", "causal_pair_dcgru"}:
+            if not self.work_width:
+                raise ValueError(
+                    f"{self.architecture} requires per-digit work channels"
+                )
+        elif self.work_width:
+            raise ValueError("work_width is reserved for causal DCGRU architectures")
         if self.entropy_weight < 0:
             raise ValueError("entropy_weight cannot be negative")
         if self.initialization_std is not None and self.initialization_std <= 0:
@@ -299,6 +312,24 @@ EXPERIMENTS = {
     "causal_dcgru_contract": ExperimentConfig(
         model=ModelConfig(
             architecture="causal_dcgru",
+            d_model=48,
+            num_loops=4,
+            training_loop_cap=3,
+            step_layers=4,
+            scratch_tokens=0,
+            work_width=16,
+            digit_slots=16,
+            structured_features=True,
+            initialization_std=0.02,
+        ),
+        optimizer=OptimizerConfig(
+            learning_rate=3e-3,
+            wall_clock_schedule=True,
+        ),
+    ),
+    "causal_pair_dcgru_contract": ExperimentConfig(
+        model=ModelConfig(
+            architecture="causal_pair_dcgru",
             d_model=48,
             num_loops=4,
             training_loop_cap=3,
@@ -814,23 +845,87 @@ class CausalDCGRUStep(nn.Module):
         self.modulus_projection = nn.Linear(config.d_model, mutable_width)
         self.cell = DirectionalDCGRUCell(mutable_width)
 
-    def forward(
-        self,
-        residue: Tensor,
-        modulus: Tensor,
-        work: Tensor,
-    ) -> tuple[Tensor, Tensor]:
+    def _validate_work(self, residue: Tensor, work: Tensor) -> None:
         expected_work_shape = (*residue.shape[:2], self.work_width)
         if work.shape != expected_work_shape:
             raise ValueError(
                 f"causal_dcgru expected work shape {expected_work_shape}, "
                 f"received {tuple(work.shape)}"
             )
-        state = torch.cat((residue, work), dim=-1)
+
+    def _directional_sweep(
+        self,
+        state: Tensor,
+        modulus: Tensor,
+    ) -> Tensor:
         static = self.modulus_projection(modulus)
         condition = self.cell.condition(static)
         for _ in range(self.microsteps):
             state = self.cell(state, condition)
+        return state
+
+    def forward(
+        self,
+        residue: Tensor,
+        modulus: Tensor,
+        work: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        self._validate_work(residue, work)
+        state = torch.cat((residue, work), dim=-1)
+        state = self._directional_sweep(state, modulus)
+        return state.split((self.residue_width, self.work_width), dim=-1)
+
+
+class LearnedGlobalPairInteraction(nn.Module):
+    def __init__(self, digit_slots: int, residue_width: int, output_width: int) -> None:
+        super().__init__()
+        self.digit_slots = digit_slots
+        self.residue_norm = RMSNorm(residue_width)
+        self.aggregate_norm = RMSNorm(residue_width)
+        self.left_projection = nn.Linear(residue_width, residue_width)
+        self.right_projection = nn.Linear(residue_width, residue_width)
+        self.output_projection = nn.Linear(residue_width, output_width)
+        self.route_logits = nn.Parameter(
+            torch.zeros(digit_slots, digit_slots, digit_slots)
+        )
+
+    def routing_weights(self) -> Tensor:
+        return self.route_logits.flatten(1).softmax(dim=-1).view_as(
+            self.route_logits
+        )
+
+    def forward(self, residue: Tensor) -> Tensor:
+        normalized = self.residue_norm(residue)
+        left = self.left_projection(normalized)
+        right = self.right_projection(normalized)
+        pair_values = left[:, :, None, :] * right[:, None, :, :]
+        aggregate = torch.einsum(
+            "kij,bijd->bkd",
+            self.routing_weights(),
+            pair_values,
+        )
+        return self.output_projection(self.aggregate_norm(aggregate))
+
+
+class CausalPairDCGRUStep(CausalDCGRUStep):
+    def __init__(self, config: ModelConfig) -> None:
+        super().__init__(config)
+        self.pair_interaction = LearnedGlobalPairInteraction(
+            config.digit_slots,
+            config.d_model,
+            config.d_model + config.work_width,
+        )
+
+    def forward(
+        self,
+        residue: Tensor,
+        modulus: Tensor,
+        work: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        self._validate_work(residue, work)
+        state = torch.cat((residue, work), dim=-1)
+        state = state + self.pair_interaction(residue)
+        state = self._directional_sweep(state, modulus)
         return state.split((self.residue_width, self.work_width), dim=-1)
 
 
@@ -853,6 +948,8 @@ class CausalStateModel(nn.Module):
         )
         if architecture.architecture == "causal_grid":
             self.step = CausalGridStep(architecture)
+        elif architecture.architecture == "causal_pair_dcgru":
+            self.step = CausalPairDCGRUStep(architecture)
         elif architecture.architecture == "causal_dcgru":
             self.step = CausalDCGRUStep(architecture)
         else:
@@ -943,7 +1040,10 @@ class CausalStateModel(nn.Module):
             2,
         )
         batch = input_ids.shape[0]
-        if self.architecture.architecture == "causal_dcgru":
+        if self.architecture.architecture in {
+            "causal_dcgru",
+            "causal_pair_dcgru",
+        }:
             scratch = residue[:, :, : self.architecture.work_width] * 0
         elif self.scratch_embedding is None:
             scratch = residue.new_empty(batch, 0, residue.shape[-1])
@@ -1278,7 +1378,12 @@ class RegisterModel(nn.Module):
 
 
 def build_model_from_config(spec: ModelSpec, config: ModelConfig) -> nn.Module:
-    if config.architecture in {"causal_state", "causal_grid", "causal_dcgru"}:
+    if config.architecture in {
+        "causal_state",
+        "causal_grid",
+        "causal_dcgru",
+        "causal_pair_dcgru",
+    }:
         model = CausalStateModel(spec, config)
     elif config.architecture == "register":
         model = RegisterModel(spec, config)

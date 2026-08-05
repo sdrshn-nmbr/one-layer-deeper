@@ -88,6 +88,11 @@ class RecurrentSubmissionTests(unittest.TestCase):
         }
         self.assertEqual(configs["baseline"]["num_loops"], 1)
         self.assertEqual(configs["scaled_init"]["initialization_std"], 0.02)
+        self.assertEqual(
+            configs["causal_dcgru_contract"]
+            | {"architecture": "causal_pair_dcgru"},
+            configs["causal_pair_dcgru_contract"],
+        )
         self.assertEqual(configs["scaled_init"]["d_model"], 128)
         self.assertEqual(configs["wide_scaled"]["d_model"], 512)
         self.assertEqual(configs["wide_scaled"]["initialization_std"], 0.02)
@@ -385,7 +390,7 @@ class RecurrentSubmissionTests(unittest.TestCase):
                 architecture="causal_dcgru",
                 structured_features=True,
             )
-        with self.assertRaisesRegex(ValueError, "reserved for causal_dcgru"):
+        with self.assertRaisesRegex(ValueError, "reserved for causal DCGRU"):
             self.module.ModelConfig(
                 architecture="causal_grid",
                 structured_features=True,
@@ -622,6 +627,106 @@ class RecurrentSubmissionTests(unittest.TestCase):
             torch.testing.assert_close(state, torch.zeros_like(state))
         for state in mean_work.scratch_states[1:]:
             torch.testing.assert_close(state[0], state[1])
+
+    def test_pair_dcgru_learns_dense_routes_over_all_digit_pairs(self) -> None:
+        model = self.build("causal_pair_dcgru_contract").eval()
+        interaction = model.step.pair_interaction
+        routes = interaction.routing_weights()
+
+        self.assertEqual(tuple(routes.shape), (16, 16, 16))
+        torch.testing.assert_close(
+            routes.flatten(1).sum(dim=-1),
+            torch.ones(16),
+        )
+        self.assertTrue(interaction.route_logits.requires_grad)
+        torch.testing.assert_close(
+            routes,
+            torch.full_like(routes, 1 / 256),
+        )
+
+    def test_pair_dcgru_has_global_receptive_field_before_directional_sweep(
+        self,
+    ) -> None:
+        torch.manual_seed(107)
+        model = self.build("causal_pair_dcgru_contract").eval()
+        baseline = torch.zeros(1, 16, 48)
+        perturbed = baseline.clone()
+        perturbed[:, 0] = 1
+        with torch.no_grad():
+            expected = model.step.pair_interaction(baseline)
+            actual = model.step.pair_interaction(perturbed)
+        changed_slots = (actual - expected).abs().amax(dim=-1) > 0
+        self.assertTrue(changed_slots.all().item())
+
+    def test_pair_dcgru_reuses_pair_stage_and_directional_cell(self) -> None:
+        torch.manual_seed(109)
+        model = self.build("causal_pair_dcgru_contract").eval()
+        residue = torch.randn(2, 16, 48)
+        modulus = torch.randn_like(residue)
+        work = torch.zeros(2, 16, 16)
+        calls = {"pair": 0, "cell": 0}
+
+        def count_pair(_module, _inputs, _output) -> None:
+            calls["pair"] += 1
+
+        def count_cell(_module, _inputs, _output) -> None:
+            calls["cell"] += 1
+
+        handles = (
+            model.step.pair_interaction.register_forward_hook(count_pair),
+            model.step.cell.register_forward_hook(count_cell),
+        )
+        try:
+            with torch.no_grad():
+                model.step(residue, modulus, work)
+        finally:
+            for handle in handles:
+                handle.remove()
+        self.assertEqual(calls, {"pair": 1, "cell": 4})
+
+    def test_pair_dcgru_has_unbroken_pair_route_gradient(self) -> None:
+        torch.manual_seed(113)
+        model = self.build("causal_pair_dcgru_contract").train()
+        input_ids = torch.tensor([[2, 10, 9, 10, 3, 11, 9, 4, 10]])
+        mask = torch.ones_like(input_ids, dtype=torch.bool)
+        trace = model.forward_with_trace(input_ids, attention_mask=mask)
+        trace.logits.square().mean().backward()
+
+        route_gradient = model.step.pair_interaction.route_logits.grad
+        self.assertIsNotNone(route_gradient)
+        self.assertGreater(torch.count_nonzero(route_gradient).item(), 0)
+        left_gradient = model.step.pair_interaction.left_projection.weight.grad
+        self.assertIsNotNone(left_gradient)
+        self.assertGreater(torch.count_nonzero(left_gradient).item(), 0)
+
+    def test_pair_dcgru_interventions_isolate_content_and_routes(self) -> None:
+        torch.manual_seed(127)
+        model = self.build("causal_pair_dcgru_contract").eval()
+        interaction = model.step.pair_interaction
+        interventions = _causal_state_interventions(model)
+        residue = torch.randn(2, 16, 48)
+        with torch.no_grad():
+            expected = interaction(residue)
+
+        with interventions["zero_pair_interaction"]():
+            with torch.no_grad():
+                zeroed = interaction(residue)
+        torch.testing.assert_close(zeroed, torch.zeros_like(zeroed))
+
+        with interventions["swap_pair_interaction"]():
+            with torch.no_grad():
+                swapped = interaction(residue)
+        torch.testing.assert_close(swapped, expected.roll(shifts=1, dims=0))
+
+        with torch.no_grad():
+            interaction.route_logits.normal_()
+        original_routes = interaction.route_logits.detach().clone()
+        with interventions["uniform_pair_routes"]():
+            torch.testing.assert_close(
+                interaction.routing_weights(),
+                torch.full_like(interaction.route_logits, 1 / 256),
+            )
+        torch.testing.assert_close(interaction.route_logits, original_routes)
 
     def test_causal_state_masks_each_row_at_its_own_depth(self) -> None:
         torch.manual_seed(37)

@@ -166,6 +166,42 @@ class ResearchRunnerTests(unittest.TestCase):
         self.assertEqual(model.step.microsteps, 4)
         self.assertGreater(workload["flops"]["forward"], 0)
 
+    def test_pair_dcgru_adds_only_the_global_pair_workload_axis(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            dcgru_path = Path(directory) / "dcgru.py"
+            pair_path = Path(directory) / "pair.py"
+            materialize_submission(
+                SUBMISSION,
+                "causal_dcgru_contract",
+                dcgru_path,
+            )
+            materialize_submission(
+                SUBMISSION,
+                "causal_pair_dcgru_contract",
+                pair_path,
+            )
+            dcgru = _calculated_workload(dcgru_path, SMOKE_MANIFEST)
+            pair = _calculated_workload(pair_path, SMOKE_MANIFEST)
+            submission = _load_submission_file(pair_path)
+            model = submission.build_model(
+                ModelSpec(
+                    vocab_size=17,
+                    max_seq_len=12,
+                    maximum_model_state_elements=500_000_000,
+                )
+            )
+
+        self.assertEqual(pair["inputs"]["architecture"], "causal_pair_dcgru")
+        self.assertEqual(
+            dcgru["inputs"] | {"architecture": "causal_pair_dcgru"},
+            pair["inputs"],
+        )
+        self.assertGreater(
+            pair["flops"]["forward"],
+            dcgru["flops"]["forward"],
+        )
+        self.assertEqual(tuple(model.step.pair_interaction.route_logits.shape), (16, 16, 16))
+
     def test_smoke_run_writes_immutable_receipt_and_exact_source(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             run_dir = run_experiment(
